@@ -18,18 +18,18 @@ try:
 except ImportError:
     pass
 
-# -- Load environment variables --
+# -- Load .env file --
 load_dotenv(override=True)
 
-# -- force the third-party proxy to use api_key instead of auth_token --
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 # -- initialize the Anthropic client --
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = Anthropic(
+    base_url=os.getenv("ANTHROPIC_BASE_URL"),
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
 
 MODEL = os.environ["MODEL_ID"]
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+WORKDIR = Path.cwd()
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
 # -- Tool definition --
 TOOLS: list[ToolParam] = [
@@ -42,24 +42,53 @@ TOOLS: list[ToolParam] = [
             "required": ["command"],
         },
     },
-    # {
-    # "name": "read",
-    # "description": "Read the contents of a file.",
-    # "input_schema": {
-    #     "type": "object",
-    #     "properties": {"file_path": {"type": "string"}},
-    #     "required": ["file_path"],
-    #     },
-    # },
-    # {
-    # "name": "write",
-    # "description": "Write content to a file.",
-    # "input_schema": {
-    #     "type": "object",
-    #     "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}},
-    #     "required": ["file_path", "content"],
-    #     },
-    # },
+    {
+        "name": "read_file",
+        "description": "Read the contents of a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                # limit == max lines to return
+                "limit": {"type": "integer"},
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["file_path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace only the first exact occurrence of old_text with new_text in a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["file_path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "glob",
+        "description": "Find files matching a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
 ]
 
 
@@ -72,9 +101,11 @@ def run_bash(command: str) -> str:
         result = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
+            cwd=WORKDIR,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         result_formatted = []
@@ -83,34 +114,77 @@ def run_bash(command: str) -> str:
         if result.stderr:
             result_formatted.append(f"      stderr:{result.stderr.strip()}")
         result_formatted = (
-            "\n".join(result_formatted) if result_formatted else "      no output"
+            "\n".join(result_formatted) if result_formatted else "(No output.)"
         )
         return result_formatted[:50000]
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
+    except Exception as e:
         return f"Error: {e}"
 
 
-def run_read(file_path: str) -> str:
+# Keep file_path inside the working directory, prevent path traversal attacks
+def safe_path(file_path: str) -> Path:
+    path = (WORKDIR / file_path).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {file_path}")
+    return path
+
+
+def run_read(file_path: str, limit: int | None = None) -> str:
     try:
-        with open(file_path, "r") as file:
-            return file.read()
-    except FileNotFoundError:
-        return f"Error: File not found: {file_path}"
-    except OSError as e:
+        lines = safe_path(file_path).read_text().splitlines()
+        if limit and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)
+    except Exception as e:
         return f"Error: {e}"
 
 
 def run_write(file_path: str, content: str) -> str:
     try:
-        path = Path(file_path)
+        path = safe_path(file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(file_path, "w") as file:
-            file.write(content)
-        return "Successfully wrote to file"
-    except OSError as e:
+        path.write_text(content)
+        return f"Successfully wrote {len(content.splitlines())} lines to {file_path}"
+    except Exception as e:
         return f"Error: {e}"
+
+
+def run_edit(file_path: str, old_text: str, new_text: str) -> str:
+    try:
+        path = safe_path(file_path)
+        text = path.read_text()
+        if old_text not in text:
+            return f"Error: text not found in {file_path}"
+        path.write_text(text.replace(old_text, new_text, 1))
+        return f"{file_path}: File edited."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# glob is a module that finds files matching a pattern in the working directory
+def run_glob(pattern: str) -> str:
+    import glob as g
+
+    try:
+        results = []
+        for match in g.glob(pattern, root_dir=WORKDIR, recursive=True):
+            # pattern may contain ../ or match symlinks pointing outside the working directory
+            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
+                results.append(match)
+        return "\n".join(results) if results else "(No matches found.)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+TOOL_HANDLERS = {
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
+}
 
 
 # -- Print --
@@ -168,9 +242,14 @@ def agent_loop(messages: list):
         print("\033[33mTOOL EXECUTION: \033[0m")
         for tool_block in tool_calls:
             print(f"tool_id: {tool_block.id})")
-            print(f"[bash]command: {tool_block.input['command']}")
-            result = run_bash(cast(str, tool_block.input["command"]))
-            print(f"[bash]result: \n{result}")
+            print(f"[{tool_block.name}]input: {tool_block.input}")
+            handler = TOOL_HANDLERS.get(tool_block.name)
+            result = (
+                handler(**tool_block.input)
+                if handler
+                else f"Unknown tool: {tool_block.name}"
+            )
+            print(f"[{tool_block.name}]result: \n{result}")
             results.append(
                 {
                     "type": "tool_result",
@@ -190,7 +269,7 @@ def main() -> None:
     messages = []
     while True:
         try:
-            query = input("\033[36minput >> \033[0m")
+            query = input("\033[33mUSER >> \033[0m")
         except EOFError, KeyboardInterrupt:
             return
         if query.strip().lower() in ("q", "quit", "exit", ""):
