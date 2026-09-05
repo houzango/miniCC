@@ -29,7 +29,7 @@ client = Anthropic(
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations require user approval."
 
 # -- Tool definition --
 TOOLS: list[ToolParam] = [
@@ -94,9 +94,6 @@ TOOLS: list[ToolParam] = [
 
 # -- Tool execution --
 def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
     try:
         result = subprocess.run(
             command,
@@ -123,17 +120,9 @@ def run_bash(command: str) -> str:
         return f"Error: {e}"
 
 
-# Keep file_path inside the working directory, prevent path traversal attacks
-def safe_path(file_path: str) -> Path:
-    path = (WORKDIR / file_path).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {file_path}")
-    return path
-
-
 def run_read(file_path: str, limit: int | None = None) -> str:
     try:
-        lines = safe_path(file_path).read_text().splitlines()
+        lines = (WORKDIR / file_path).resolve().read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -143,7 +132,7 @@ def run_read(file_path: str, limit: int | None = None) -> str:
 
 def run_write(file_path: str, content: str) -> str:
     try:
-        path = safe_path(file_path)
+        path = (WORKDIR / file_path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         return f"Successfully wrote {len(content.splitlines())} lines to {file_path}"
@@ -153,7 +142,7 @@ def run_write(file_path: str, content: str) -> str:
 
 def run_edit(file_path: str, old_text: str, new_text: str) -> str:
     try:
-        path = safe_path(file_path)
+        path = (WORKDIR / file_path).resolve()
         text = path.read_text()
         if old_text not in text:
             return f"Error: text not found in {file_path}"
@@ -185,6 +174,69 @@ TOOL_HANDLERS = {
     "edit_file": run_edit,
     "glob": run_glob,
 }
+
+
+# -- three-gate permission pipeline --
+
+# Gate 1: Hard deny list - always forbidden
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+
+
+def check_deny_list(command: str) -> str | None:
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+
+# Gate 2: Rule matching - context-dependent checks
+PERMISSION_RULES = [
+    # Check if the path escapes the workspace
+    {
+        "tools": ["read_file", "write_file", "edit_file"],
+        "check": lambda args: (
+            not (WORKDIR / args.get("file_path", "")).resolve().is_relative_to(WORKDIR)
+        ),
+        "message": "Path escapes workspace",
+    },
+    # Check if the command is potentially destructive
+    {
+        "tools": ["bash"],
+        "check": lambda args: any(
+            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
+        ),
+        "message": "Potentially destructive command",
+    },
+]
+
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+
+# Gate 3: User approval - wait for confirmation after rule match
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n\033[33m[permission] {reason}\033[0m")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+# Pipeline: all three gates chained
+def check_permission(tool_block) -> bool:
+    if tool_block.name == "bash":
+        reason = check_deny_list(tool_block.input.get("command", ""))
+        if reason:
+            print(f"\033[31m[blocked] {reason}\033[0m")
+            return False
+    reason = check_rules(tool_block.name, tool_block.input)
+    if reason:
+        decision = ask_user(tool_block.name, tool_block.input, reason)
+        if decision == "deny":
+            return False
+    return True
 
 
 # -- Print --
@@ -243,6 +295,18 @@ def agent_loop(messages: list):
         for tool_block in tool_calls:
             print(f"tool_id: {tool_block.id})")
             print(f"[{tool_block.name}]input: {tool_block.input}")
+
+            if not check_permission(tool_block):
+                print(f"[{tool_block.name}]result: Permission denied.")
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content": "Permission denied.",
+                    }
+                )
+                continue
+
             handler = TOOL_HANDLERS.get(tool_block.name)
             result = (
                 handler(**tool_block.input)
