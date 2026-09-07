@@ -29,7 +29,7 @@ client = Anthropic(
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations require user approval."
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
 # -- Tool definition --
 TOOLS: list[ToolParam] = [
@@ -107,9 +107,9 @@ def run_bash(command: str) -> str:
         )
         result_formatted = []
         if result.stdout:
-            result_formatted.append(f"      stdout:{result.stdout.strip()}")
+            result_formatted.append(f"stdout:{result.stdout.strip()}")
         if result.stderr:
-            result_formatted.append(f"      stderr:{result.stderr.strip()}")
+            result_formatted.append(f"stderr:{result.stderr.strip()}")
         result_formatted = (
             "\n".join(result_formatted) if result_formatted else "(No output.)"
         )
@@ -175,73 +175,87 @@ TOOL_HANDLERS = {
     "glob": run_glob,
 }
 
+# -- Hook system --
+HOOKS = {
+    "PostUserSubmit": [],
+    "PostModelResponse": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "PreLoopEnd": [],
+}
 
-# -- three-gate permission pipeline --
 
-# Gate 1: Hard deny list - always forbidden
-DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+def register_hooks(event: str, *callbacks):
+    HOOKS[event].extend(callbacks)
 
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    # None means don't block and let it through
     return None
 
 
-# Gate 2: Rule matching - context-dependent checks
-PERMISSION_RULES = [
-    # Check if the path escapes the workspace
-    {
-        "tools": ["read_file", "write_file", "edit_file"],
-        "check": lambda args: (
-            not (WORKDIR / args.get("file_path", "")).resolve().is_relative_to(WORKDIR)
-        ),
-        "message": "Path escapes workspace",
-    },
-    # Check if the command is potentially destructive
-    {
-        "tools": ["bash"],
-        "check": lambda args: any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
+def tool_permission_hook(block):
+    """PreToolUse: permission pipeline."""
+    if block.name == "bash":
+        for pattern in DENY_LIST:
+            if pattern in block.input.get("command", ""):
+                print(
+                    f"\033[31m[{block.name}]result: '{pattern}' is blocked by deny list\033[0m"
+                )
+                return f"'{pattern}' is blocked by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in block.input.get("command", ""):
+                print(
+                    f"\033[33m[permission]Potentially destructive command: {kw}\033[0m"
+                )
+                choice = input("   Allow? [y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    print(f"[{block.name}]result: Permission denied by user")
+                    return f"Permission denied by user for destructive command: '{kw}'"
+    if block.name in ("read_file", "write_file", "edit_file"):
+        ture_path = (WORKDIR / block.input.get("file_path", "")).resolve()
+        if not ture_path.is_relative_to(WORKDIR):
+            print(f"\033[33m[permission]Path escapes workspace: {ture_path}\033[0m")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                print(f"[{block.name}]result: Permission denied by user")
+                return "Permission denied by user for path escapes workspace"
     return None
 
 
-# Gate 3: User approval - wait for confirmation after rule match
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n\033[33m[permission] {reason}\033[0m")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+def tool_log_hook(block):
+    """PreToolUse: log every tool call."""
+    print(f"tool_id: {block.id})")
+    print(f"[{block.name}]input: {block.input}")
+    return None
 
 
-# Pipeline: all three gates chained
-def check_permission(tool_block) -> bool:
-    if tool_block.name == "bash":
-        reason = check_deny_list(tool_block.input.get("command", ""))
-        if reason:
-            print(f"\033[31m[blocked] {reason}\033[0m")
-            return False
-    reason = check_rules(tool_block.name, tool_block.input)
-    if reason:
-        decision = ask_user(tool_block.name, tool_block.input, reason)
-        if decision == "deny":
-            return False
-    return True
+def tool_result_print_hook(block, result):
+    """PostToolUse: print the tool result."""
+    print(f"[{block.name}]result: \n{result}")
+    return None
 
 
-# -- Print --
-def print_response(response_content):
+def cwd_display_hook(query: str):
+    """PostUserSubmit: display the current working directory."""
+    print()
+    print(f"\033[90m[WORKDIR]: {WORKDIR}\033[0m")
+    print()
+    return None
+
+
+def model_response_print_hook(response_content):
     """
+    PostModelResponse: print the response content
+
     Args:
         response_content: list of content_block_objects from LLM response
     """
@@ -262,6 +276,28 @@ def print_response(response_content):
             print(f"input: {block.input}")
 
     print()
+    return None
+
+
+def tool_summary_hook(messages: list):
+    """PreLoopEnd: print a summary of the session."""
+    tool_count = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for r in content:
+                if isinstance(r, dict) and r.get("type") == "tool_result":
+                    tool_count += 1
+    print(f"\033[90m[tool_summary]: session used {tool_count} tool calls\033[0m")
+    print()
+    return None
+
+
+register_hooks("PostUserSubmit", cwd_display_hook)
+register_hooks("PostModelResponse", model_response_print_hook)
+register_hooks("PreToolUse", tool_log_hook, tool_permission_hook)
+register_hooks("PostToolUse", tool_result_print_hook)
+register_hooks("PreLoopEnd", tool_summary_hook)
 
 
 # -- The core pattern: a while loop that calls tools --
@@ -277,7 +313,7 @@ def agent_loop(messages: list):
         )
 
         # response.content is a list of content_block_objects
-        print_response(response.content)
+        trigger_hooks("PostModelResponse", response.content)
         # Add the assistant's response to the messages
         messages.append({"role": "assistant", "content": response.content})
 
@@ -287,22 +323,23 @@ def agent_loop(messages: list):
 
         # If there are no tool calls, loop ends
         if not tool_calls:
+            loop_continue = trigger_hooks("PreLoopEnd", messages)
+            if loop_continue:
+                messages.append({"role": "user", "content": loop_continue})
+                continue
             return
 
         # If there are tool calls, execute them, collect results
         results = []
         print("\033[33mTOOL EXECUTION: \033[0m")
         for tool_block in tool_calls:
-            print(f"tool_id: {tool_block.id})")
-            print(f"[{tool_block.name}]input: {tool_block.input}")
-
-            if not check_permission(tool_block):
-                print(f"[{tool_block.name}]result: Permission denied.")
+            denied = trigger_hooks("PreToolUse", tool_block)
+            if denied:
                 results.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": tool_block.id,
-                        "content": "Permission denied.",
+                        "content": str(denied),
                     }
                 )
                 continue
@@ -313,7 +350,8 @@ def agent_loop(messages: list):
                 if handler
                 else f"Unknown tool: {tool_block.name}"
             )
-            print(f"[{tool_block.name}]result: \n{result}")
+
+            trigger_hooks("PostToolUse", tool_block, result)
             results.append(
                 {
                     "type": "tool_result",
@@ -338,6 +376,7 @@ def main() -> None:
             return
         if query.strip().lower() in ("q", "quit", "exit", ""):
             return
+        trigger_hooks("PostUserSubmit", query)
         messages.append({"role": "user", "content": query})
         agent_loop(messages)
 
