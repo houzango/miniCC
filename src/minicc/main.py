@@ -1,7 +1,8 @@
+import ast
+import json
 import os
 import subprocess
 from pathlib import Path
-from typing import cast
 
 from anthropic import Anthropic
 from anthropic.types import ToolParam, ToolUseBlock
@@ -29,7 +30,9 @@ client = Anthropic(
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain.
+    Before starting any multi-step task, use manage_todo tool to plan your steps.
+    Update status as you go."""
 
 # -- Tool definition --
 TOOLS: list[ToolParam] = [
@@ -87,6 +90,37 @@ TOOLS: list[ToolParam] = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "manage_todo",
+        "description": (
+            "Create a list of steps for a multi-step task, and update their status "
+            "throughout the session. Pass the full todos list on every call. "
+            "Exactly one todo may be in_progress at a time. When moving to the "
+            "next step, mark the current one completed and the next one in_progress "
+            "in the same call."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "minLength": 1},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                }
+            },
+            "required": ["todos"],
         },
     },
 ]
@@ -167,12 +201,82 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 
+class TodoManager:
+    def __init__(self):
+        self.todos: list[dict] = []
+
+    def update(self, todos: list | str) -> str:
+        if isinstance(todos, str):
+            try:
+                todos = json.loads(todos)
+            except json.JSONDecodeError:
+                try:
+                    todos = ast.literal_eval(todos)
+                except (SyntaxError, ValueError) as e:
+                    raise ValueError(
+                        "todos must be a list or a JSON array string."
+                    ) from e
+
+        if not isinstance(todos, list):
+            raise ValueError("todos must be a list or a JSON array string.")
+        if len(todos) > 20:
+            raise ValueError("A maximum of 20 todos is allowed")
+
+        normalized_todos = []
+        in_progress_count = 0
+        for index, todo in enumerate(todos):
+            if not isinstance(todo, dict):
+                raise ValueError(f"todos[{index}] must be a JSON object")
+            content = str(todo.get("content", "")).strip()
+            status = str(todo.get("status", "pending")).lower()
+            if not content:
+                raise ValueError(f"todos[{index}] requires content")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"todos[{index}] has invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            normalized_todos.append({"content": content, "status": status})
+
+        if in_progress_count > 1:
+            raise ValueError("Only one todo can be in_progress at a time")
+
+        self.todos = normalized_todos
+        return self.render()
+
+    def render(self) -> str:
+        if not self.todos:
+            return "The list of todos is empty."
+
+        lines = []
+        for todo in self.todos:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[✅]",
+            }[todo["status"]]
+            lines.append(f"{marker} {todo['content']}")
+
+        done = sum(todo["status"] == "completed" for todo in self.todos)
+        lines.append(f"\n({done}/{len(self.todos)} completed)")
+        return "\n".join(lines)
+
+
+TODO_MANAGER = TodoManager()
+
+
+def run_manage_todo(todos: list | str) -> str:
+    result = TODO_MANAGER.update(todos)
+    print(f"\n\033[33m## Current Todos\033[0m\n{result}")
+    return result
+
+
 TOOL_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "manage_todo": run_manage_todo,
 }
 
 # -- Hook system --
@@ -331,6 +435,7 @@ def agent_loop(messages: list):
 
         # If there are tool calls, execute them, collect results
         results = []
+        manage_todo_used = False
         print("\033[33mTOOL EXECUTION: \033[0m")
         for tool_block in tool_calls:
             denied = trigger_hooks("PreToolUse", tool_block)
@@ -345,20 +450,40 @@ def agent_loop(messages: list):
                 continue
 
             handler = TOOL_HANDLERS.get(tool_block.name)
-            result = (
-                handler(**tool_block.input)
-                if handler
-                else f"Unknown tool: {tool_block.name}"
-            )
+            try:
+                result = (
+                    handler(**tool_block.input)
+                    if handler
+                    else f"Unknown tool: {tool_block.name}"
+                )
+            except Exception as e:
+                result = f"Tool error: {e}"
 
             trigger_hooks("PostToolUse", tool_block, result)
+
+            if tool_block.name == "manage_todo":
+                manage_todo_used = True
+
             results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_block.id,
-                    "content": result.strip(),
+                    "content": str(result).strip(),
                 }
             )
+
+        # If there is incomplete work in the todo list and manage_todo was not used, add a reminder
+        has_incomplete_work = any(
+            t["status"] != "completed" for t in TODO_MANAGER.todos
+        )
+        if has_incomplete_work and not manage_todo_used:
+            results.append(
+                {
+                    "type": "text",
+                    "text": "<reminder>Update your todos if needed.</reminder>",
+                }
+            )
+
         print()
 
         # Add the tool results to the messages, loop continues
