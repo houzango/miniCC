@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from anthropic import Anthropic
-from anthropic.types import ToolParam, ToolUseBlock
+from anthropic.types import MessageParam, ToolParam, ToolUseBlock
 from dotenv import load_dotenv
 
 try:
@@ -346,6 +346,73 @@ def run_manage_todo(todos: list | str) -> str:
     return result
 
 
+def extract_text(content) -> str:
+    """Extract text from LLM response content blocks."""
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(
+        getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text"
+    )
+
+
+def spawn_subagent(description: str) -> str:
+    """Spawn a subagent with fresh messages[], return summary only."""
+    print("\n\033[35m[Subagent spawned]\033[0m")
+    messages: list[MessageParam] = [{"role": "user", "content": description}]
+
+    for _ in range(30):  # safety limit
+        response = client.messages.create(
+            model=MODEL,
+            system=SUB_SYSTEM,
+            messages=messages,
+            tools=SUB_TOOLS,
+            max_tokens=8000,
+        )
+
+        # response.content is a list of content_block_objects
+        trigger_hooks("PostModelResponse", response.content)
+        # Add the assistant's response to the messages
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_calls: list[ToolUseBlock] = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+
+        # If there are no tool calls, loop ends
+        if not tool_calls:
+            print("\n\033[35m[Subagent completed]\033[0m")
+            return f"Subagent completed: {extract_text(response.content)}"
+
+        # If there are tool calls, execute them, collect results
+        results = []
+        print("\033[33mTOOL EXECUTION: \033[0m")
+        for tool_block in tool_calls:
+            result_dict = execute_tool(tool_block, SUB_TOOL_HANDLERS)
+            results.append(result_dict)
+
+        print()
+
+        # Add the tool results to the messages, loop continues
+        messages.append({"role": "user", "content": results})
+
+    messages.append(
+        {
+            "role": "user",
+            "content": "You're out of turns. Stop using tools and give your best final answer now, based on what you've done so far.",
+        }
+    )
+    response = client.messages.create(
+        model=MODEL,
+        system=SUB_SYSTEM,
+        messages=messages,
+        tools=[],
+        max_tokens=8000,
+    )
+    trigger_hooks("PostModelResponse", response.content)
+    print("\n\033[35m[Subagent hit turn limit]\033[0m")
+    return f"Subagent hit turn limit before finishing. Last response: {extract_text(response.content)}"
+
+
 TOOL_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
@@ -489,6 +556,34 @@ register_hooks("PostToolUse", tool_result_print_hook)
 register_hooks("PreLoopEnd", tool_summary_hook)
 
 
+def execute_tool(tool_block: ToolUseBlock, handlers: dict) -> dict:
+    denied = trigger_hooks("PreToolUse", tool_block)
+    if denied:
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_block.id,
+            "content": str(denied),
+        }
+
+    handler = handlers.get(tool_block.name)
+    try:
+        result = (
+            handler(**tool_block.input)
+            if handler
+            else f"Unknown tool: {tool_block.name}"
+        )
+    except Exception as e:
+        result = f"Tool error: {e}"
+
+    trigger_hooks("PostToolUse", tool_block, result)
+
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_block.id,
+        "content": str(result).strip(),
+    }
+
+
 # -- The core pattern: a while loop that calls tools --
 def agent_loop(messages: list):
 
@@ -523,36 +618,8 @@ def agent_loop(messages: list):
         manage_todo_used = False
         print("\033[33mTOOL EXECUTION: \033[0m")
         for tool_block in tool_calls:
-            denied = trigger_hooks("PreToolUse", tool_block)
-            if denied:
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_block.id,
-                        "content": str(denied),
-                    }
-                )
-                continue
-
-            handler = TOOL_HANDLERS.get(tool_block.name)
-            try:
-                result = (
-                    handler(**tool_block.input)
-                    if handler
-                    else f"Unknown tool: {tool_block.name}"
-                )
-            except Exception as e:
-                result = f"Tool error: {e}"
-
-            trigger_hooks("PostToolUse", tool_block, result)
-
-            results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": str(result).strip(),
-                }
-            )
+            result_dict = execute_tool(tool_block, TOOL_HANDLERS)
+            results.append(result_dict)
 
             if tool_block.name == "manage_todo":
                 manage_todo_used = True
