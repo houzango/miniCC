@@ -30,9 +30,17 @@ client = Anthropic(
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain.
-    Before starting any multi-step task, use manage_todo tool to plan your steps.
-    Update status as you go."""
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain. "
+    "Before starting any multi-step task, use manage_todo tool to plan your steps. "
+    "Update status as you go."
+)
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the given subtask, then return a concise final conclusion. "
+    "Do not delegate further."
+)
+
 
 # -- Tool definition --
 TOOLS: list[ToolParam] = [
@@ -121,6 +129,74 @@ TOOLS: list[ToolParam] = [
                 }
             },
             "required": ["todos"],
+        },
+    },
+    {
+        "name": "task",
+        "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"description": {"type": "string"}},
+            "required": ["description"],
+        },
+    },
+]
+
+SUB_TOOLS: list[ToolParam] = [
+    {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read the contents of a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                # limit == max lines to return
+                "limit": {"type": "integer"},
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["file_path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace only the first exact occurrence of old_text with new_text in a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["file_path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "glob",
+        "description": "Find files matching a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
         },
     },
 ]
@@ -277,6 +353,15 @@ TOOL_HANDLERS = {
     "edit_file": run_edit,
     "glob": run_glob,
     "manage_todo": run_manage_todo,
+    "task": spawn_subagent,
+}
+
+SUB_TOOL_HANDLERS = {
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
 }
 
 # -- Hook system --
@@ -461,9 +546,6 @@ def agent_loop(messages: list):
 
             trigger_hooks("PostToolUse", tool_block, result)
 
-            if tool_block.name == "manage_todo":
-                manage_todo_used = True
-
             results.append(
                 {
                     "type": "tool_result",
@@ -471,6 +553,9 @@ def agent_loop(messages: list):
                     "content": str(result).strip(),
                 }
             )
+
+            if tool_block.name == "manage_todo":
+                manage_todo_used = True
 
         # If there is incomplete work in the todo list and manage_todo was not used, add a reminder
         has_incomplete_work = any(
