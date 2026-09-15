@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import yaml
 from anthropic import Anthropic
 from anthropic.types import MessageParam, ToolParam, ToolUseBlock
 from dotenv import load_dotenv
@@ -30,17 +31,90 @@ client = Anthropic(
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain. "
-    "Before starting any multi-step task, use manage_todo tool to plan your steps. "
-    "Update status as you go."
-)
-SUB_SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Complete the given subtask, then return a concise final conclusion. "
-    "Do not delegate further."
-)
+SKILLS_DIR = WORKDIR / "skills"
 
+
+# Skill catalog scan (used by build_system below)
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        meta = {}
+    return meta, parts[2].strip()
+
+
+# Build skill registry at startup (used for safe lookup in load_skill)
+SKILL_REGISTRY: dict[str, dict] = {}
+
+
+def _register_skills():
+    """Scan skills/ dir, populate SKILL_REGISTRY with name/description/content."""
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        manifest = d / "SKILL.md"
+        if manifest.exists():
+            raw = manifest.read_text()
+            meta, body = _parse_frontmatter(raw)
+            name = meta.get("name", d.name)
+            description = meta.get(
+                "description", body.split("\n")[0].lstrip("#").strip()
+            )
+            SKILL_REGISTRY[name] = {
+                "directory": str(d),
+                "name": name,
+                "description": description,
+                "content": raw,
+            }
+
+
+_register_skills()
+
+
+def list_skills() -> str:
+    """List all skills (name + one-line description)."""
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(
+        f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values()
+    )
+
+
+def build_system() -> str:
+    """Build SYSTEM prompt with skill catalog injected at startup."""
+    skills_catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain. "
+        "Before starting any multi-step task, use manage_todo tool to plan your steps. "
+        "Update status as you go."
+        f"Skills available:\n{skills_catalog}\n"
+        "Use load_skill to get full skill details when needed."
+    )
+
+
+def build_sub_system() -> str:
+    """Build SUB_SYSTEM prompt with skill catalog injected at startup."""
+    skills_catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}. "
+        "Complete the given subtask, then return a concise final conclusion. "
+        "Do not delegate further."
+        f"Skills available:\n{skills_catalog}\n"
+        "Use load_skill to get full skill details when needed."
+    )
+
+
+SYSTEM = build_system()
+
+SUB_SYSTEM = build_sub_system()
 
 # -- Tool definition --
 TOOLS: list[ToolParam] = [
@@ -140,6 +214,15 @@ TOOLS: list[ToolParam] = [
             "required": ["description"],
         },
     },
+    {
+        "name": "load_skill",
+        "description": "Load the full content of a skill by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
 ]
 
 SUB_TOOLS: list[ToolParam] = [
@@ -197,6 +280,15 @@ SUB_TOOLS: list[ToolParam] = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "load_skill",
+        "description": "Load the full content of a skill by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
         },
     },
 ]
@@ -275,6 +367,14 @@ def run_glob(pattern: str) -> str:
         return "\n".join(results) if results else "(No matches found.)"
     except Exception as e:
         return f"Error: {e}"
+
+
+def load_skill(name: str) -> str:
+    """Load full skill content. Lookup skill by name via registry — no path traversal."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return f"(Skill directory: {skill['directory']})\n\n{skill['content']}"
 
 
 class TodoManager:
@@ -419,6 +519,7 @@ TOOL_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "load_skill": load_skill,
     "manage_todo": run_manage_todo,
     "task": spawn_subagent,
 }
@@ -429,6 +530,7 @@ SUB_TOOL_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "load_skill": load_skill,
 }
 
 # -- Hook system --
